@@ -10,12 +10,14 @@ import csv
 import json
 import math
 import sys
+import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
 import audit
 import mock_actions
+import support_rules
 from ezio_client import EzioError, analyze
 
 HERE = Path(__file__).resolve().parent
@@ -23,6 +25,7 @@ PERSONAS = HERE.parent / "personas"
 POLICY = json.loads((HERE / "policy.json").read_text())
 
 APPROVE, HOLD, BLOCK = "APPROVE", "HOLD_FOR_REVIEW", "BLOCK"
+PASS = "PASS"
 RANK = {APPROVE: 0, HOLD: 1, BLOCK: 2}
 
 
@@ -53,6 +56,7 @@ class Decision:
     reason: str
     evidence: list
     ezio: dict
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 def parse_signals(resp):
@@ -94,17 +98,32 @@ def load_source_of_truth(persona):
     return data
 
 
-def check_source_of_truth(text, context, sot):
-    """TODO: the part where use Ezio's results and Compare the text against your persona's data to Decisions.
-
-    Return a list of Finding(level, message), where level is BLOCK or HOLD_FOR_REVIEW.
-    Return [] when nothing is wrong. Read your persona's business_rules.md first.
-
-    Example (customer support): pull "NN% loyalty discount" out of the text and compare it
-    with sot["policies"]["discounts"]["loyalty"]["percent"]:
-        return [Finding(BLOCK, "Loyalty discount is 15%, the email says 30%.")]
-    """
+def check_source_of_truth(text, context, sot, persona="customer_support"):
+    """Compare the draft with the persona's own data. Returns Finding(level, message) where level is
+    BLOCK, HOLD_FOR_REVIEW, or PASS (a fact we verified; evidence only, never changes the decision)."""
+    if persona == "customer_support":
+        return [Finding(level, msg) for level, msg in support_rules.check(text, context, sot)]
     return []
+
+
+def ezio_claim_findings(signals):
+    """Ezio's per-claim fact-check: a contradicted claim blocks even if the overall tier looks fine."""
+    out = []
+    for c in signals.claims:
+        if not isinstance(c, dict):
+            continue
+        claim = c.get("text") or c.get("claim") or "a claim"
+        src = c.get("source")
+        if isinstance(src, dict):
+            src = src.get("publisher") or src.get("url")
+        source = f" (source: {src})" if src else ""
+        if c.get("verdict") == "contradicted":
+            out.append(Finding(BLOCK, f"Ezio fact-check contradicts: \"{claim}\"{source}"))
+        elif c.get("verdict") == "supported":
+            out.append(Finding(PASS, f"Ezio fact-check supports: \"{claim}\"{source}"))
+    if signals.claims_contradicted and not any(f.level == BLOCK for f in out):
+        out.append(Finding(BLOCK, f"Ezio reports {signals.claims_contradicted} contradicted claim(s)."))
+    return out
 
 
 def apply_policy(signals, findings, policy):
@@ -117,11 +136,12 @@ def apply_policy(signals, findings, policy):
             decision = level
 
     for f in findings:
-        raise_to(f.level, f.message)
+        if f.level != PASS:
+            raise_to(f.level, f.message)
     for dim, rule in policy["dimension_minimums"].items():
         score = getattr(signals, dim)
         if score < rule["hold_below"]:
-            raise_to(HOLD, f"{dim} score {score} is below {rule['hold_below']}")
+            raise_to(HOLD, f"Ezio {dim} score is {score}, below our minimum of {rule['hold_below']}")
     if signals.accuracy_status == "not_scored" and policy["when_accuracy_not_scored"] != "ignore":
         raise_to(policy["when_accuracy_not_scored"], "accuracy was not scored (no claims checked)")
     if signals.accuracy_status == "unavailable":
@@ -134,21 +154,35 @@ def apply_policy(signals, findings, policy):
     return reasons, decision
 
 
+def evidence_lines(findings):
+    tag = {BLOCK: "[BLOCK]", HOLD: "[HOLD]", PASS: "[OK]"}
+    return [f"{tag[f.level]} {f.message}" for f in findings]
+
+
 def decide(text, context=None, persona="customer_support", scenario=None, audit_log=True):
     context = context or {}
+    # Our own data check never depends on Ezio, so it still works when Ezio is down.
+    findings = check_source_of_truth(text, context, load_source_of_truth(persona), persona)
     try:
         response = analyze(text, scenario=scenario)
         signals = parse_signals(response)
     except EzioError as e:
-        result = Decision(POLICY["on_ezio_failure"], f"Ezio unavailable: {e}", [],
+        # Fail closed: without Ezio we can't see tone, bias, or public-law claims. A fact our own data
+        # proves wrong is still a BLOCK; anything else goes to a human.
+        blocks = [f for f in findings if f.level == BLOCK]
+        decision = BLOCK if blocks else POLICY["on_ezio_failure"]
+        reason = "; ".join(f.message for f in blocks) if blocks else "Ezio could not score this draft, so a person must review it before sending"
+        result = Decision(decision, f"Ezio unavailable ({e}). {reason}",
+                          evidence_lines(findings) + [f"[HOLD] Ezio error: {e}"],
                           {"error": str(e), "response": e.response})
     else:
-        findings = check_source_of_truth(text, context, load_source_of_truth(persona))
+        findings += ezio_claim_findings(signals)
         reasons, decision = apply_policy(signals, findings, POLICY)
-        result = Decision(
-            decision, "; ".join(reasons), [f.message for f in findings],
-            response,
-        )
+        if decision == APPROVE and any(f.level == PASS for f in findings):
+            reasons = [f"All checkable facts match company data (Ezio {signals.tier} {signals.score})"]
+        result = Decision(decision, "; ".join(reasons), evidence_lines(findings) + [
+            f"Ezio: {signals.tier} {signals.score}, accuracy {signals.accuracy_status}, "
+            f"tone {signals.tone}, bias {signals.bias}, agreement {signals.agreement}"], response)
     if audit_log:
         audit.record(persona, text, context, result)
     return result
